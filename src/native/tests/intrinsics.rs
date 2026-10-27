@@ -552,6 +552,49 @@ declare i16 @air.pack.unorm.rgb565.v3f16(<3 x half>)
     let _ = std::fs::remove_dir_all(tmp);
 }
 
+/// Mish's AMD session (2026-10-27): 166 dispatches refused `unhandled_pack_intrinsic:
+/// _air.pack.unorm.rgb10a2.v4f16` - an `rgb10a2<half4>` store. 10/10/10/2 fields, exact.
+#[test]
+fn native_air_pack_unorm_rgb10a2_f16_lowers_to_exact_fields() {
+    let ll = r#"
+target triple = "spirv-unknown-vulkan1.2"
+define void @main(ptr addrspace(1) %out) {
+entry:
+  %packed = call i32 @air.pack.unorm.rgb10a2.v4f16(<4 x half> <half 0xH3C00, half 0xH3800, half 0xH0000, half 0xH3C00>)
+  store i32 %packed, ptr addrspace(1) %out, align 4
+  ret void
+}
+
+declare i32 @air.pack.unorm.rgb10a2.v4f16(<4 x half>)
+
+!air.kernel = !{!0}
+!0 = !{ptr @main, !1, !2}
+!1 = !{}
+!2 = !{!3}
+!3 = !{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.write", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"uint*", !"air.arg_name", !"out"}
+"#;
+    let tmp = std::env::temp_dir().join(format!(
+        "metal2vulkan_native_pack_unorm_rgb10a2_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::create_dir_all(&tmp);
+    let spv = crate::translate_sanitized_native(ll, Stage::Kernel, &tmp).expect("translate");
+    let asm = disassemble(&spv).expect("disassemble");
+    assert!(asm.contains("OpFConvert"), "{asm}");
+    assert_eq!(asm.matches(" FClamp ").count(), 4, "{asm}");
+    assert_eq!(asm.matches(" Round ").count(), 4, "{asm}");
+    assert_eq!(asm.matches("OpShiftLeftLogical").count(), 3, "{asm}");
+    assert_eq!(asm.matches("OpBitwiseOr").count(), 3, "{asm}");
+    if std::process::Command::new("spirv-val")
+        .arg("--version")
+        .output()
+        .is_ok()
+    {
+        tools::spirv_val_bytes(&spv, &tmp).expect("spirv-val");
+    }
+    let _ = std::fs::remove_dir_all(tmp);
+}
+
 #[test]
 fn native_coherent_air_store_and_fence_lower_to_memory_ops() {
     let ll = r#"
