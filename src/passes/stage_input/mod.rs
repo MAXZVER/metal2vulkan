@@ -17,7 +17,7 @@ pub(in crate::passes) use kernel_grid::{
 pub(in crate::passes) use kernel_values::const_ivec;
 use kernel_values::{
     bind_kernel_uvec3_builtin, bind_kernel_uvec3_builtin_var, const_kernel_local_size,
-    is_raw_uint_buffer_block,
+    declare_stage_in_block, is_raw_uint_buffer_block, plan_kernel_stage_input, vector_lanes_of,
 };
 use layout::*;
 
@@ -214,12 +214,18 @@ pub(in crate::passes) enum ParamBinding {
     },
     /// A buffer block variable, with the lowering of the body's param uses (see `BufWrap`).
     Buffer { var: Word, wrap: BufWrap },
-    /// A compute `[[stage_in]]` value. Vulkan has no compute-stage attribute stream, so the
-    /// translator exposes each attribute as a read-only StorageBuffer array and indexes it by
-    /// `GlobalInvocationId.x`.
+    /// A compute `[[stage_in]]` value, lowered against the pipeline's stage-input
+    /// descriptor (`TransformOptions::kernel_stage_input`): one read-only
+    /// StorageBuffer whose block mirrors the descriptor's scalar layout
+    /// (explicit member offsets, `ArrayStride` = the layout stride), indexed
+    /// per thread by `GlobalInvocationId[axis] + thread_base[axis] +
+    /// stage_in_region.origin[axis]` — Metal's fetch definition for the
+    /// `ThreadPositionInGrid{X,Y}` step functions.
     StageInput {
         var: Word,
         value_ty: Word,
+        attrs: Vec<kernel_values::StageInAttr>,
+        axis: u32,
         index_var: Word,
         dispatch_var: Option<Word>,
     },
@@ -667,27 +673,71 @@ pub(super) fn build_stage_input(
         if let (Stage::Kernel, Some(KernRole::StageInput(_))) =
             (stage, kern.and_then(|m| m.role_of(idx)))
         {
-            let rta = ctx.ty_runtime_array(*pty);
-            let block_ty = ctx.module.fresh_id();
-            ctx.new_globals.push(type_inst(
-                Op::TypeStruct,
-                block_ty,
-                vec![Operand::IdRef(rta)],
-            ));
-            let pptr = ctx.ty_ptr(StorageClass::StorageBuffer, block_ty);
-            let var = ctx.module.fresh_id();
-            ctx.new_globals.push(Instruction::new(
-                Op::Variable,
-                Some(pptr),
-                Some(var),
-                vec![Operand::StorageClass(StorageClass::StorageBuffer)],
-            ));
+            // TEMP (Task72): the pipeline's decoded stage-input descriptor
+            // lowers the parameter — the StorageBuffer block mirrors it (one
+            // scalar member per loaded component at its descriptor offset,
+            // ArrayStride = the layout stride), and the fetch index follows
+            // Metal's definition (see `kernel_grid`): thread position in grid
+            // + exact-thread region base + stage-in region origin.
+            let Some(stage_in) = ctx.kernel_stage_input.as_ref() else {
+                // No descriptor: the raw-copy ABI stands (the block is the
+                // parameter type itself, indexed by grid X plus the
+                // exact-thread base) — the `interface` test's contract, and
+                // the only honest answer for a caller that carries no
+                // pipeline stage-input state.
+                let rta = ctx.ty_runtime_array(*pty);
+                let block_ty = ctx.module.fresh_id();
+                ctx.new_globals.push(type_inst(
+                    Op::TypeStruct,
+                    block_ty,
+                    vec![Operand::IdRef(rta)],
+                ));
+                let pptr = ctx.ty_ptr(StorageClass::StorageBuffer, block_ty);
+                let var = ctx.module.fresh_id();
+                ctx.new_globals.push(Instruction::new(
+                    Op::Variable,
+                    Some(pptr),
+                    Some(var),
+                    vec![Operand::StorageClass(StorageClass::StorageBuffer)],
+                ));
+                let binding = stage_input_bindings
+                    .get(&idx)
+                    .copied()
+                    .ok_or_else(|| format!("kernel stage_in parameter {idx} missing binding"))?;
+                let binding = buffer_resource_binding(descriptor_layout, binding)?;
+                decorate_binding(&mut ctx.module, var, descriptor_layout.set, binding);
+                let index_var = bind_kernel_v3uint_builtin_once(
+                    ctx,
+                    &mut global_invocation_id_var,
+                    BuiltIn::GlobalInvocationId,
+                );
+                bindings.push((
+                    *pid,
+                    ParamBinding::StageInput {
+                        var,
+                        value_ty: *pty,
+                        attrs: Vec::new(),
+                        axis: 0,
+                        index_var,
+                        dispatch_var: kernel_grid_push_constant_var,
+                    },
+                ));
+                buffer_structs.push((var, block_ty));
+                continue;
+            };
+            let plan = plan_kernel_stage_input(stage_in)?;
+            let dispatch_var = kernel_grid_push_constant_var.ok_or_else(|| {
+                "stage-in kernel needs the dispatch-region push block for its \
+                 fetch index and origin"
+                    .to_string()
+            })?;
+            let block = declare_stage_in_block(ctx, &plan)?;
             let binding = stage_input_bindings
                 .get(&idx)
                 .copied()
                 .ok_or_else(|| format!("kernel stage_in parameter {idx} missing binding"))?;
             let binding = buffer_resource_binding(descriptor_layout, binding)?;
-            decorate_binding(&mut ctx.module, var, descriptor_layout.set, binding);
+            decorate_binding(&mut ctx.module, block.var, descriptor_layout.set, binding);
             let index_var = bind_kernel_v3uint_builtin_once(
                 ctx,
                 &mut global_invocation_id_var,
@@ -696,13 +746,38 @@ pub(super) fn build_stage_input(
             bindings.push((
                 *pid,
                 ParamBinding::StageInput {
-                    var,
+                    var: block.var,
                     value_ty: *pty,
+                    attrs: block.attrs,
+                    axis: plan.axis,
                     index_var,
-                    dispatch_var: kernel_grid_push_constant_var,
+                    dispatch_var: Some(dispatch_var),
                 },
             ));
-            buffer_structs.push((var, block_ty));
+        } else if let (Stage::Kernel, Some(role @ (KernRole::StageInGridOrigin | KernRole::StageInGridSize))) =
+            (stage, kern.and_then(|m| m.role_of(idx)))
+        {
+            // Metal hands the kernel the stage-in region it fetches through;
+            // the push block carries its origin at words 12-14 and its size at
+            // 15-17, and the existing dispatch-field binding shapes them to the
+            // parameter's type.
+            let (first_member, name) = match role {
+                KernRole::StageInGridOrigin => (12, "stage_in_grid_origin"),
+                _ => (15, "stage_in_grid_size"),
+            };
+            let Some(dispatch_var) = kernel_grid_push_constant_var else {
+                return Err(format!("{name} needs the dispatch-region push block"));
+            };
+            let lanes = vector_lanes_of(&defs, *pty).unwrap_or(1);
+            bindings.push((
+                *pid,
+                ParamBinding::LoadKernelDispatchField {
+                    var: dispatch_var,
+                    first_member,
+                    out_ty: *pty,
+                    lanes,
+                },
+            ));
         } else if role_is("texture") && is_array_texture {
             let (elem_image_ty, dim, arrayed, comp, multisampled, runtime_specialization) =
                 if let Some((dim, arrayed, fmt, comp)) = wtex_dims.get(pid).copied() {

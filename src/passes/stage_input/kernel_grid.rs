@@ -2,8 +2,16 @@
 
 use super::*;
 
-/// Declare the twelve-scalar push-constant block once. Separate `u32` members keep the public ABI
-/// tightly packed without inheriting a `uvec3` aggregate alignment.
+/// Declare the eighteen-scalar push-constant block once. Separate `u32` members keep the public ABI
+/// tightly packed without inheriting a `uvec3` aggregate alignment. Members 12-14 are the
+/// stage-in region origin, 15-17 its size (Metal's `MTLRegion` is 3D; `[[stage_in_grid_origin]]`
+/// and `[[stage_in_grid_size]]` may be `uint`, `uint2` or `uint3`).
+///
+/// Metal's `MTLComputeCommandEncoder.setStageInRegion:` states the region whose ORIGIN offsets
+/// the per-thread stage-in fetch: for `MTLStepFunctionThreadPositionInGridX` the attribute index
+/// is `thread_position_in_grid.x + region.origin.x` (and .y/.origin.y for the Y form) — the
+/// origin indexes INTO the stage-in buffer, which is exactly what the `[[stage_in]]` lowering
+/// and the `[[stage_in_grid_origin]]` parameter both read here.
 pub(in crate::passes) fn bind_kernel_grid_push_constant_once(
     ctx: &mut Ctx,
     slot: &mut Option<Word>,
@@ -17,7 +25,9 @@ pub(in crate::passes) fn bind_kernel_grid_push_constant_once(
     ctx.new_globals.push(type_inst(
         Op::TypeStruct,
         block_ty,
-        (0..12).map(|_| Operand::IdRef(uint_ty)).collect(),
+        (0..crate::reflect::KERNEL_DISPATCH_PUSH_CONSTANT_SIZE / 4)
+            .map(|_| Operand::IdRef(uint_ty))
+            .collect(),
     ));
     ctx.module.annotations.push(Instruction::new(
         Op::Decorate,
@@ -28,7 +38,7 @@ pub(in crate::passes) fn bind_kernel_grid_push_constant_once(
             Operand::Decoration(Decoration::Block),
         ],
     ));
-    for member in 0..12 {
+    for member in 0..crate::reflect::KERNEL_DISPATCH_PUSH_CONSTANT_SIZE / 4 {
         ctx.module.annotations.push(Instruction::new(
             Op::MemberDecorate,
             None,
@@ -98,7 +108,9 @@ pub(in crate::passes) fn materialize_kernel_dispatch_field(
     out_ty: Word,
     lanes: u32,
 ) -> Result<Word, String> {
-    if !(1..=3).contains(&lanes) || first_member > 9 {
+    if !(1..=3).contains(&lanes)
+        || first_member + lanes > crate::reflect::KERNEL_DISPATCH_PUSH_CONSTANT_SIZE / 4
+    {
         return Err(format!(
             "kernel dispatch field has unsupported member {first_member} and lane count {lanes}"
         ));

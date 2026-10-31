@@ -726,12 +726,18 @@ impl<'a> Analyzer<'a> {
         let pointer = self.definitions.get(&pointer_ty).copied()?;
         let block_ty = pointer.operands.get(1).and_then(id_ref)?;
         let block = self.definitions.get(&block_ty).copied()?;
-        if block.class.opcode != Op::TypeStruct || block.operands.len() != 12 {
+        // The dispatch payload block: one u32 member per word of the reflected
+        // payload (12 grid words + the stage-in region origin and size).  Its
+        // width comes from the one constant both sides use - a literal here
+        // silently stops every thread-base load from being recognised when
+        // the block grows (Task72/73: three footprint tests).
+        let words = (super::KERNEL_DISPATCH_PUSH_CONSTANT_SIZE / 4) as usize;
+        if block.class.opcode != Op::TypeStruct || block.operands.len() != words {
             return None;
         }
         let first_offset = *self.decorations.member_offsets.get(&(block_ty, 0))?;
         let exact_layout = first_offset % 4 == 0
-            && (0..12).all(|index| {
+            && (0..words as u32).all(|index| {
                 self.decorations.member_offsets.get(&(block_ty, index))
                     == Some(&(first_offset + u64::from(index) * 4))
             });

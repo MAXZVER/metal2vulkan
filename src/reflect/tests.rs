@@ -38,7 +38,9 @@ fn kernel_dispatch_push_constant_range_is_exact_and_validated() {
         .push_constant_range(),
         Some(KernelDispatchPushConstantRange {
             offset: DEFAULT_KERNEL_DISPATCH_PUSH_CONSTANT_OFFSET,
-            size: 48,
+            // The whole payload block, stage-in origin words included: the
+            // range is one ABI shared by every kernel (Task72).
+            size: KERNEL_DISPATCH_PUSH_CONSTANT_SIZE,
         })
     );
 }

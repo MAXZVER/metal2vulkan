@@ -1434,7 +1434,10 @@ entry:
             .and_then(crate::reflect::KernelDispatch::push_constant_range),
         Some(crate::reflect::KernelDispatchPushConstantRange {
             offset: 16,
-            size: 48,
+            // 12 grid words + 2 stage-in origin words: one payload ABI for
+            // every kernel (Task72) — a kernel without stage-in simply never
+            // reads words 12/13.
+            size: crate::reflect::KERNEL_DISPATCH_PUSH_CONSTANT_SIZE,
         })
     );
     tools::spirv_val_bytes(&spv, &tmp).expect("spirv-val");

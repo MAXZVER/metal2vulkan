@@ -820,9 +820,14 @@ pub(in crate::passes) fn apply_bindings(
             ParamBinding::StageInput {
                 var,
                 value_ty,
+                attrs,
+                axis,
                 index_var,
                 dispatch_var,
             } => {
+                // Metal's stage-in fetch: index = thread_position_in_grid[axis]
+                // + thread_base[axis] (the exact-thread region base) + the
+                // stage-in region origin[axis] — see kernel_grid's doc.
                 let v3u = ctx.ty_vec_uint(3);
                 let uint_ty = ctx.ty_uint();
                 let gid = ctx.module.fresh_id();
@@ -832,41 +837,167 @@ pub(in crate::passes) fn apply_bindings(
                     Some(gid),
                     vec![Operand::IdRef(index_var)],
                 ));
-                let relative_x = ctx.module.fresh_id();
+                let relative = ctx.module.fresh_id();
                 loads.push(Instruction::new(
                     Op::CompositeExtract,
                     Some(uint_ty),
-                    Some(relative_x),
-                    vec![Operand::IdRef(gid), Operand::LiteralBit32(0)],
+                    Some(relative),
+                    vec![Operand::IdRef(gid), Operand::LiteralBit32(axis)],
                 ));
-                let x = if let Some(dispatch_var) = dispatch_var {
-                    let base = load_kernel_dispatch_component(ctx, &mut loads, dispatch_var, 3);
-                    let absolute = ctx.module.fresh_id();
+                if attrs.is_empty() {
+                    // Raw-copy ABI (no descriptor): grid X plus the
+                    // exact-thread base, one load of the parameter type.
+                    let x = if let Some(dispatch_var) = dispatch_var {
+                        let base =
+                            load_kernel_dispatch_component(ctx, &mut loads, dispatch_var, 3);
+                        let absolute = ctx.module.fresh_id();
+                        loads.push(Instruction::new(
+                            Op::IAdd,
+                            Some(uint_ty),
+                            Some(absolute),
+                            vec![Operand::IdRef(relative), Operand::IdRef(base)],
+                        ));
+                        absolute
+                    } else {
+                        relative
+                    };
+                    let zero = ctx.const_uint(0);
+                    let ptr_ty = ctx.ty_ptr(StorageClass::StorageBuffer, value_ty);
+                    let ptr = ctx.module.fresh_id();
                     loads.push(Instruction::new(
-                        Op::IAdd,
-                        Some(uint_ty),
-                        Some(absolute),
-                        vec![Operand::IdRef(relative_x), Operand::IdRef(base)],
+                        Op::AccessChain,
+                        Some(ptr_ty),
+                        Some(ptr),
+                        vec![Operand::IdRef(var), Operand::IdRef(zero), Operand::IdRef(x)],
                     ));
-                    absolute
-                } else {
-                    relative_x
-                };
-                let zero = ctx.const_uint(0);
-                let ptr_ty = ctx.ty_ptr(StorageClass::StorageBuffer, value_ty);
-                let ptr = ctx.module.fresh_id();
+                    let value = ctx.module.fresh_id();
+                    loads.push(Instruction::new(
+                        Op::Load,
+                        Some(value_ty),
+                        Some(value),
+                        vec![Operand::IdRef(ptr)],
+                    ));
+                    splices.push((pid, value));
+                    continue;
+                }
+                let dispatch_var =
+                    dispatch_var.expect("a descriptor stage-in binding carries the push var");
+                let base = load_kernel_dispatch_component(ctx, &mut loads, dispatch_var, 3 + axis);
+                let origin =
+                    load_kernel_dispatch_component(ctx, &mut loads, dispatch_var, 12 + axis);
+                let with_base = ctx.module.fresh_id();
                 loads.push(Instruction::new(
-                    Op::AccessChain,
-                    Some(ptr_ty),
-                    Some(ptr),
-                    vec![Operand::IdRef(var), Operand::IdRef(zero), Operand::IdRef(x)],
+                    Op::IAdd,
+                    Some(uint_ty),
+                    Some(with_base),
+                    vec![Operand::IdRef(relative), Operand::IdRef(base)],
                 ));
+                let index = ctx.module.fresh_id();
+                loads.push(Instruction::new(
+                    Op::IAdd,
+                    Some(uint_ty),
+                    Some(index),
+                    vec![Operand::IdRef(with_base), Operand::IdRef(origin)],
+                ));
+                let zero = ctx.const_uint(0);
+                // A float member of the AIR struct fed by a half format
+                // converts per lane; anything else loads in its own kind.
+                let member_ty = |member: usize| -> Option<Word> {
+                    defs.get(&value_ty)?.operands.get(member).and_then(
+                        |operand| match operand {
+                            Operand::IdRef(ty) => Some(*ty),
+                            _ => None,
+                        },
+                    )
+                };
+                let is_f32 = |ty: Word| -> bool {
+                    match defs.get(&ty).map(|d| (d.class.opcode, d.operands.as_slice())) {
+                        Some((Op::TypeFloat, [Operand::LiteralBit32(32)])) => true,
+                        Some((
+                            Op::TypeVector,
+                            [Operand::IdRef(scalar), Operand::LiteralBit32(_)],
+                        )) => matches!(
+                            defs.get(scalar).map(|d| (d.class.opcode, d.operands.as_slice())),
+                            Some((Op::TypeFloat, [Operand::LiteralBit32(32)]))
+                        ),
+                        _ => false,
+                    }
+                };
+                let f32_ty = ctx.ty_float();
+                let mut members: Vec<Word> = Vec::with_capacity(attrs.len());
+                for (member, attr) in attrs.iter().enumerate() {
+                    let member_f32 =
+                        attr.half && member_ty(member).is_some_and(|ty| is_f32(ty));
+                    let mut lanes: Vec<Word> = Vec::with_capacity(attr.lanes as usize);
+                    for flat in attr.first_member..attr.first_member + attr.lanes {
+                        let ptr_ty = ctx.ty_ptr(StorageClass::StorageBuffer, attr.scalar_ty);
+                        let member_idx = ctx.const_uint(flat);
+                        let ptr = ctx.module.fresh_id();
+                        loads.push(Instruction::new(
+                            Op::AccessChain,
+                            Some(ptr_ty),
+                            Some(ptr),
+                            vec![
+                                Operand::IdRef(var),
+                                Operand::IdRef(zero),
+                                Operand::IdRef(index),
+                                Operand::IdRef(member_idx),
+                            ],
+                        ));
+                        let raw = ctx.module.fresh_id();
+                        loads.push(Instruction::new(
+                            Op::Load,
+                            Some(attr.scalar_ty),
+                            Some(raw),
+                            vec![Operand::IdRef(ptr)],
+                        ));
+                        let lane_value = if member_f32 {
+                            let converted = ctx.module.fresh_id();
+                            loads.push(Instruction::new(
+                                Op::FConvert,
+                                Some(f32_ty),
+                                Some(converted),
+                                vec![Operand::IdRef(raw)],
+                            ));
+                            converted
+                        } else {
+                            raw
+                        };
+                        lanes.push(lane_value);
+                    }
+                    let value = if attr.lanes == 1 {
+                        lanes[0]
+                    } else if member_f32 {
+                        let vector_ty = ctx.ty_vecf(attr.lanes);
+                        let vector = ctx.module.fresh_id();
+                        loads.push(Instruction::new(
+                            Op::CompositeConstruct,
+                            Some(vector_ty),
+                            Some(vector),
+                            lanes.into_iter().map(Operand::IdRef).collect(),
+                        ));
+                        vector
+                    } else {
+                        let vector_ty = attr
+                            .vec_ty
+                            .expect("lanes > 1 carry their vector type");
+                        let vector = ctx.module.fresh_id();
+                        loads.push(Instruction::new(
+                            Op::CompositeConstruct,
+                            Some(vector_ty),
+                            Some(vector),
+                            lanes.into_iter().map(Operand::IdRef).collect(),
+                        ));
+                        vector
+                    };
+                    members.push(value);
+                }
                 let value = ctx.module.fresh_id();
                 loads.push(Instruction::new(
-                    Op::Load,
+                    Op::CompositeConstruct,
                     Some(value_ty),
                     Some(value),
-                    vec![Operand::IdRef(ptr)],
+                    members.into_iter().map(Operand::IdRef).collect(),
                 ));
                 splices.push((pid, value));
             }
