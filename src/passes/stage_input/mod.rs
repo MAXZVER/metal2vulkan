@@ -1555,8 +1555,29 @@ pub(super) fn build_stage_input(
             bindings.push((*pid, binding));
         } else if role_is("patch_id") {
             let uint_ty = ctx.ty_uint();
-            let var =
-                bind_kernel_uint_builtin_once(ctx, &mut primitive_id_var, BuiltIn::PrimitiveId);
+            // In a post-tessellation function the patch index comes from the
+            // control stage, as a per-patch input at the system-input location
+            // the reflection reports (`TessellationInterface::patch_id`); see
+            // `VertMeta::tessellation_system_input_location`.
+            let patch_location = vert
+                .filter(|meta| meta.is_tessellation_evaluation())
+                .and_then(|meta| meta.tessellation_system_input_location(&VertRole::PatchId));
+            let var = if let Some(location) = patch_location {
+                let pptr = ctx.ty_ptr(StorageClass::Input, uint_ty);
+                let var = ctx.module.fresh_id();
+                ctx.new_globals.push(Instruction::new(
+                    Op::Variable,
+                    Some(pptr),
+                    Some(var),
+                    vec![Operand::StorageClass(StorageClass::Input)],
+                ));
+                decorate_location(&mut ctx.module, var, location);
+                decorate_patch(&mut ctx.module, var);
+                ctx.interface.push(var);
+                var
+            } else {
+                bind_kernel_uint_builtin_once(ctx, &mut primitive_id_var, BuiltIn::PrimitiveId)
+            };
             if *pty == uint_ty {
                 bindings.push((*pid, ParamBinding::LoadVar { var, ty: uint_ty }));
             } else {

@@ -87,7 +87,9 @@ mod footprint;
 /// v41 stops reporting a constexpr sampler the finished module does not bind. A state no sample
 /// reads leaves a variable nothing references, which the module drops; reflection still asked a
 /// consumer to create a `VkSampler` there. 112 such bindings in 60 of the 2880-source sample.
-pub const REFLECTION_VERSION: u32 = 43;
+/// v44 reads a post-tessellation function's `[[patch_id]]` from a per-patch input the control
+/// stage writes, and reports its location as `TessellationInterface::patch_id`.
+pub const REFLECTION_VERSION: u32 = 44;
 
 /// Size in bytes of the twelve tightly packed `u32` values used by exact-thread dispatches: thread
 /// grid, thread base, threadgroup base, and total threadgroup grid (three dimensions each).
@@ -1580,6 +1582,10 @@ pub struct TessellationInterface {
     pub instance_id: Option<TessellationAttribute>,
     pub amplification_id: Option<TessellationAttribute>,
     pub amplification_count: Option<TessellationAttribute>,
+    /// `[[patch_id]]`, read from a per-patch input the control stage writes (the
+    /// draw's patch index, `patchStart` included) rather than from
+    /// `PrimitiveId`. `None` when the function does not ask for it.
+    pub patch_id: Option<TessellationAttribute>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2887,6 +2893,7 @@ impl ShaderReflection {
                         meta,
                         &VertRole::AmplificationCount,
                     ),
+                    patch_id: tessellation_system_attribute(meta, &VertRole::PatchId),
                 }
             }),
             imageblock_layouts: Vec::new(),

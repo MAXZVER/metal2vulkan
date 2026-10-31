@@ -562,6 +562,12 @@ impl VertMeta {
             VertRole::InstanceId => Some(base),
             VertRole::AmplificationId => Some(base + 1),
             VertRole::AmplificationCount => Some(base + 2),
+            // Read from the control stage rather than from `PrimitiveId`: a
+            // runtime that draws one patch per instance (so that per-patch data
+            // can arrive as instance-rate vertex attributes) restarts
+            // `PrimitiveId` at every instance, and only the control stage knows
+            // which patch of the draw the instance is.
+            VertRole::PatchId => Some(base + 3),
             _ => None,
         }
     }
