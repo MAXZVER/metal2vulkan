@@ -87,11 +87,15 @@ mod footprint;
 /// v41 stops reporting a constexpr sampler the finished module does not bind. A state no sample
 /// reads leaves a variable nothing references, which the module drops; reflection still asked a
 /// consumer to create a `VkSampler` there. 112 such bindings in 60 of the 2880-source sample.
-pub const REFLECTION_VERSION: u32 = 41;
+/// v44 reads a post-tessellation function's `[[patch_id]]` from a per-patch input the control
+/// stage writes, and reports its location as `TessellationInterface::patch_id`.
+pub const REFLECTION_VERSION: u32 = 44;
 
 /// Size in bytes of the twelve tightly packed `u32` values used by exact-thread dispatches: thread
 /// grid, thread base, threadgroup base, and total threadgroup grid (three dimensions each).
-pub const KERNEL_DISPATCH_PUSH_CONSTANT_SIZE: u32 = 48;
+/// Words 12-14 are the stage-in region origin (Metal `setStageInRegion:`), added to the per-thread
+/// stage-in fetch index, and 15-17 the region size: see `passes::stage_input::kernel_grid`.
+pub const KERNEL_DISPATCH_PUSH_CONSTANT_SIZE: u32 = 72;
 
 /// Vulkan specialization-constant ids which select the exact local size of a decomposed dispatch
 /// region. Consumers must specialize all three values when creating each region pipeline.
@@ -634,6 +638,54 @@ impl From<crate::passes::Stage> for ShaderStage {
             crate::passes::Stage::Kernel => ShaderStage::Kernel,
         }
     }
+}
+
+/// Capacity of the fixed stage-input descriptor arrays: Metal's own count
+/// fields are 5 bits wide.
+pub const STAGE_IN_MAX: usize = 31;
+
+/// A compute pipeline's decoded stage-input descriptor, as
+/// `TransformOptions::kernel_stage_input`. Fixed-capacity and `Copy` because
+/// `TransformOptions` is; entries are `Some` for the leading
+/// `attributes_len`/`layouts_len` elements.
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+pub struct KernelStageInput {
+    pub attributes: [Option<KernelStageInAttribute>; STAGE_IN_MAX],
+    pub attributes_len: u8,
+    pub layouts: [Option<KernelStageInLayout>; STAGE_IN_MAX],
+    pub layouts_len: u8,
+}
+
+impl KernelStageInput {
+    pub fn attributes(&self) -> impl Iterator<Item = KernelStageInAttribute> + '_ {
+        self.attributes[..self.attributes_len as usize]
+            .iter()
+            .flatten()
+            .copied()
+    }
+    pub fn layouts(&self) -> impl Iterator<Item = KernelStageInLayout> + '_ {
+        self.layouts[..self.layouts_len as usize].iter().flatten().copied()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+pub struct KernelStageInAttribute {
+    /// Struct member (`[[attribute(N)]]`) the descriptor entry feeds.
+    pub location: u32,
+    /// Metal buffer-table slot the attribute bytes come from.
+    pub buffer_index: u32,
+    /// `MTLAttributeFormat` ordinal as decoded.
+    pub format: u32,
+    /// Byte offset of the attribute inside one stride.
+    pub offset: u32,
+}
+
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+pub struct KernelStageInLayout {
+    pub buffer_index: u32,
+    /// `MTLStepFunction` ordinal as decoded.
+    pub step_function: u32,
+    pub stride: u32,
 }
 
 /// The kind of a bound shader resource.
@@ -1530,6 +1582,10 @@ pub struct TessellationInterface {
     pub instance_id: Option<TessellationAttribute>,
     pub amplification_id: Option<TessellationAttribute>,
     pub amplification_count: Option<TessellationAttribute>,
+    /// `[[patch_id]]`, read from a per-patch input the control stage writes (the
+    /// draw's patch index, `patchStart` included) rather than from
+    /// `PrimitiveId`. `None` when the function does not ask for it.
+    pub patch_id: Option<TessellationAttribute>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2837,6 +2893,7 @@ impl ShaderReflection {
                         meta,
                         &VertRole::AmplificationCount,
                     ),
+                    patch_id: tessellation_system_attribute(meta, &VertRole::PatchId),
                 }
             }),
             imageblock_layouts: Vec::new(),

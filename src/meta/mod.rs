@@ -562,6 +562,12 @@ impl VertMeta {
             VertRole::InstanceId => Some(base),
             VertRole::AmplificationId => Some(base + 1),
             VertRole::AmplificationCount => Some(base + 2),
+            // Read from the control stage rather than from `PrimitiveId`: a
+            // runtime that draws one patch per instance (so that per-patch data
+            // can arrive as instance-rate vertex attributes) restarts
+            // `PrimitiveId` at every instance, and only the control stage knows
+            // which patch of the draw the instance is.
+            VertRole::PatchId => Some(base + 3),
             _ => None,
         }
     }
@@ -675,6 +681,13 @@ pub enum KernRole {
     /// by `air.location_index`; Vulkan lowering needs an explicit per-invocation data ABI and must
     /// not silently bind it to zero.
     StageInput(u32),
+    /// `[[stage_in_grid_origin]]` (`uint`/`uint2`/`uint3`, like `MTLRegion`): the
+    /// dispatch's stage-in region origin, read from the kernel dispatch push
+    /// block's origin words (12-14).
+    StageInGridOrigin,
+    /// `[[stage_in_grid_size]]` (`uint`/`uint2`/`uint3`): the stage-in region size, push-block
+    /// words 15-17.
+    StageInGridSize,
     Other,
 }
 
@@ -1011,6 +1024,8 @@ fn parse_air_kernel_meta_with_nodes(
                 }
                 KernRole::StageInput(resource_location(node, idx))
             }
+            "stage_in_grid_origin" => KernRole::StageInGridOrigin,
+            "stage_in_grid_size" => KernRole::StageInGridSize,
             _ => KernRole::Other,
         };
         roles.push((idx, role));
@@ -2056,6 +2071,8 @@ pub const KERNEL_INPUT_ROLES: &[&str] = &[
     "simdgroup_index_in_threadgroup",
     "simdgroups_per_threadgroup",
     "stage_in",
+    "stage_in_grid_origin",
+    "stage_in_grid_size",
     "texture",
     "thread_index_in_quadgroup",
     "thread_index_in_simdgroup",

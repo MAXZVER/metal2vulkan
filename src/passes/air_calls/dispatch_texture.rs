@@ -201,6 +201,9 @@ pub(in crate::passes) fn lower_pack(
     if name.starts_with("air.pack.unorm.rgb565") {
         return lower_pack_rgb565(ctx, name, res, rty, args);
     }
+    if name.starts_with("air.pack.unorm.rgb10a2") {
+        return lower_pack_rgb10a2(ctx, name, res, rty, args);
+    }
     let (pack_op, _, _) =
         packed_format(name).ok_or_else(|| format!("unhandled pack intrinsic: {name}"))?;
     let mut out = Vec::new();
@@ -242,31 +245,85 @@ fn lower_pack_rgb565(
     rty: Word,
     args: &[Word],
 ) -> Result<Vec<Instruction>, String> {
-    if args.len() != 1 {
-        return Err(format!("{name} expects 1 operand"));
-    }
     if int_scalar_width(ctx, rty) != Some(16) {
         return Err(format!("{name} result is not a 16-bit integer"));
     }
+    let (mut out, packed) =
+        pack_unorm_fields(ctx, name, args, 3, &[(0, 31.0, 0), (1, 63.0, 5), (2, 31.0, 11)])?;
+    out.push(Instruction::new(
+        Op::UConvert,
+        Some(rty),
+        Some(res),
+        vec![Operand::IdRef(packed)],
+    ));
+    Ok(out)
+}
+
+/// `air.pack.unorm.rgb10a2.<arg>` packs four normalized components into the Metal `uint`
+/// contract of `rgb10a2<float4>`: R occupies bits 0..10, G bits 10..20, B bits 20..30 and A bits
+/// 30..32 - the exact inverse of [`lower_unpack_rgb10a2`]. Same normalized conversion as
+/// [`lower_pack_rgb565`]; GLSL.std.450 has no 10/10/10/2 pack. Seen in Mish's AMD session as the
+/// only untranslated kernel intrinsic (166 refused dispatches; `.v4f16`).
+fn lower_pack_rgb10a2(
+    ctx: &mut Ctx,
+    name: &str,
+    res: Word,
+    rty: Word,
+    args: &[Word],
+) -> Result<Vec<Instruction>, String> {
+    if int_scalar_width(ctx, rty) != Some(32) {
+        return Err(format!("{name} result is not a 32-bit integer"));
+    }
+    let (mut out, packed) = pack_unorm_fields(
+        ctx,
+        name,
+        args,
+        4,
+        &[(0, 1023.0, 0), (1, 1023.0, 10), (2, 1023.0, 20), (3, 3.0, 30)],
+    )?;
+    // The fields were assembled as `uint`; a result declared as the same type takes the value
+    // as it is, any other 32-bit integer type takes its bits.
+    out.push(Instruction::new(
+        if rty == ctx.ty_uint() { Op::CopyObject } else { Op::Bitcast },
+        Some(rty),
+        Some(res),
+        vec![Operand::IdRef(packed)],
+    ));
+    Ok(out)
+}
+
+/// The normalized fields of a mixed-width unorm pack: each `(component, field maximum, shift)`
+/// is clamped to [0, 1], scaled, rounded to nearest, converted to `uint` and shifted into place,
+/// and the fields are OR-ed together. Returns the instructions and the packed `uint`.
+fn pack_unorm_fields(
+    ctx: &mut Ctx,
+    name: &str,
+    args: &[Word],
+    components: u32,
+    fields: &[(u32, f32, u32)],
+) -> Result<(Vec<Instruction>, Word), String> {
+    if args.len() != 1 {
+        return Err(format!("{name} expects 1 operand"));
+    }
     let arg_ty = value_result_type(ctx, args[0])
         .ok_or_else(|| format!("{name} operand has no result type"))?;
-    let v3float = ctx.ty_vecf(3);
-    if float_equivalent(ctx, arg_ty) != v3float {
+    let vfloat = ctx.ty_vecf(components);
+    if float_equivalent(ctx, arg_ty) != vfloat {
         return Err(format!(
-            "{name} operand is not a three-component float vector"
+            "{name} operand is not a {components}-component float vector"
         ));
     }
 
     let float = ctx.ty_float();
     let uint = ctx.ty_uint();
     let mut out = Vec::new();
-    let vector = if arg_ty == v3float {
+    let vector = if arg_ty == vfloat {
         args[0]
     } else {
         let widened = ctx.module.fresh_id();
         out.push(Instruction::new(
             Op::FConvert,
-            Some(v3float),
+            Some(vfloat),
             Some(widened),
             vec![Operand::IdRef(args[0])],
         ));
@@ -275,8 +332,8 @@ fn lower_pack_rgb565(
 
     let zero = ctx.const_float(0.0);
     let one = ctx.const_float(1.0);
-    let mut fields = Vec::with_capacity(3);
-    for (component, maximum, shift) in [(0u32, 31.0f32, 0u32), (1, 63.0, 5), (2, 31.0, 11)] {
+    let mut packed: Option<Word> = None;
+    for &(component, maximum, shift) in fields {
         let extracted = ctx.module.fresh_id();
         let clamped = ctx.module.fresh_id();
         let scaled = ctx.module.fresh_id();
@@ -325,8 +382,8 @@ fn lower_pack_rgb565(
             Some(integer),
             vec![Operand::IdRef(rounded)],
         ));
-        if shift == 0 {
-            fields.push(integer);
+        let field = if shift == 0 {
+            integer
         } else {
             let shifted = ctx.module.fresh_id();
             out.push(Instruction::new(
@@ -338,31 +395,24 @@ fn lower_pack_rgb565(
                     Operand::IdRef(ctx.const_uint(shift)),
                 ],
             ));
-            fields.push(shifted);
-        }
+            shifted
+        };
+        packed = Some(match packed {
+            None => field,
+            Some(acc) => {
+                let joined = ctx.module.fresh_id();
+                out.push(Instruction::new(
+                    Op::BitwiseOr,
+                    Some(uint),
+                    Some(joined),
+                    vec![Operand::IdRef(acc), Operand::IdRef(field)],
+                ));
+                joined
+            }
+        });
     }
-
-    let rg = ctx.module.fresh_id();
-    let packed = ctx.module.fresh_id();
-    out.push(Instruction::new(
-        Op::BitwiseOr,
-        Some(uint),
-        Some(rg),
-        vec![Operand::IdRef(fields[0]), Operand::IdRef(fields[1])],
-    ));
-    out.push(Instruction::new(
-        Op::BitwiseOr,
-        Some(uint),
-        Some(packed),
-        vec![Operand::IdRef(rg), Operand::IdRef(fields[2])],
-    ));
-    out.push(Instruction::new(
-        Op::UConvert,
-        Some(rty),
-        Some(res),
-        vec![Operand::IdRef(packed)],
-    ));
-    Ok(out)
+    let packed = packed.ok_or_else(|| format!("{name} has no fields"))?;
+    Ok((out, packed))
 }
 
 /// `air.unpack.unorm.rgb10a2.<ret>` has no GLSL.std.450 equivalent, so unpack the 10/10/10/2

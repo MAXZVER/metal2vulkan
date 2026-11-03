@@ -821,6 +821,22 @@ fn kernel_stage_in_is_preserved_as_role() {
 }
 
 #[test]
+fn kernel_stage_in_grid_origin_and_size_are_roles() {
+    // q1409: the Memoji deform kernels take the stage-in region's origin and size.
+    let ll = r#"
+!air.kernel = !{!0}
+!0 = !{ptr @k, !1, !2}
+!1 = !{}
+!2 = !{!3, !4}
+!3 = !{i32 0, !"air.stage_in_grid_origin", !"air.arg_type_name", !"uint", !"air.arg_name", !"origin"}
+!4 = !{i32 1, !"air.stage_in_grid_size", !"air.arg_type_name", !"uint2", !"air.arg_name", !"size"}
+"#;
+    let m = parse_air_kernel_meta(ll).unwrap();
+    assert_eq!(m.role_of(0), Some(&KernRole::StageInGridOrigin));
+    assert_eq!(m.role_of(1), Some(&KernRole::StageInGridSize));
+}
+
+#[test]
 fn kernel_indirect_buffer_is_a_buffer_role() {
     let ll = r#"
 !air.kernel = !{!0}

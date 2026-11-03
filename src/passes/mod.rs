@@ -45,6 +45,10 @@ pub struct TransformOptions {
     /// with its payload at offset zero. `Workgroups` explicitly asserts that every dispatched
     /// workgroup is complete.
     pub kernel_dispatch: Option<crate::reflect::KernelDispatch>,
+    /// Compute stage-input descriptor. `None` keeps a kernel `[[stage_in]]`
+    /// parameter refused (no lowering without the pipeline's layout); a
+    /// descriptor lowers the parameter against what it names.
+    pub kernel_stage_input: Option<crate::reflect::KernelStageInput>,
     /// M-D2: lower `air.simd_{sum,min,max,and,or,xor}` REDUCE as a `GroupNonUniform ClusteredReduce`
     /// over a 32-lane cluster (Metal's simdgroup width) instead of a whole-subgroup Reduce, so a
     /// driver whose subgroup is WIDER than 32 still reduces over exactly the 32 lanes Apple's `simd_*`
@@ -77,6 +81,7 @@ impl Default for TransformOptions {
             descriptor_layout: crate::reflect::DescriptorLayout::default(),
             kernel_local_size: [64, 1, 1],
             kernel_dispatch: None,
+            kernel_stage_input: None,
             simd_cluster32: false,
             denorm_flush_to_zero_f32: false,
             raster_sample_count: None,
@@ -358,6 +363,7 @@ struct Ctx {
     kernel_workgroup_size_id: Option<Word>,
     /// Shared source for AIR grid builtins and exact boundary-region decomposition.
     kernel_dispatch: crate::reflect::KernelDispatch,
+    pub(crate) kernel_stage_input: Option<crate::reflect::KernelStageInput>,
     /// M-D2 simd-reduce clustering opt-in (see [`TransformOptions::simd_cluster32`]).
     simd_cluster32: bool,
     /// Exact graphics-pipeline sample count used to lower `air.get_num_samples.i32`.
@@ -456,6 +462,7 @@ impl Ctx {
             kernel_dispatch: options
                 .kernel_dispatch
                 .unwrap_or_else(crate::reflect::KernelDispatch::safe_default),
+            kernel_stage_input: options.kernel_stage_input,
             simd_cluster32: options.simd_cluster32,
             raster_sample_count: options.raster_sample_count,
             runtime_sampler_states: options.runtime_sampler_states,
